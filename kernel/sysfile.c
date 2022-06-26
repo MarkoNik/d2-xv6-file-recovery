@@ -203,7 +203,7 @@ sys_unlink(void)
 	if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0)
 		goto bad;
 
-	if((ip = dirlookup(dp, name, &off)) == 0)
+	if((ip = dirlookup(dp, name, &off, 0)) == 0)
 		goto bad;
 	ilock(ip);
 
@@ -214,9 +214,11 @@ sys_unlink(void)
 		goto bad;
 	}
 
-	memset(&de, 0, sizeof(de));
-	if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
+	// set deleted flag in dirent
+	char del = 0x01;
+	if(writei(dp, &del, off + 2, sizeof(char)) != sizeof(char))
 		panic("unlink: writei");
+
 	if(ip->type == T_DIR){
 		dp->nlink--;
 		iupdate(dp);
@@ -247,7 +249,7 @@ create(char *path, short type, short major, short minor)
 		return 0;
 	ilock(dp);
 
-	if((ip = dirlookup(dp, name, 0)) != 0){
+	if((ip = dirlookup(dp, name, 0, 0)) != 0){
 		iunlockput(dp);
 		ilock(ip);
 		if(type == T_FILE && ip->type == T_FILE)
@@ -439,5 +441,110 @@ sys_pipe(void)
 	}
 	fd[0] = fd0;
 	fd[1] = fd1;
+	return 0;
+}
+
+
+int
+sys_lsdel(void)
+{
+	char *path, *result;
+	struct inode *dp;
+
+	if(argstr(0, &path) < 0 || argstr(1, &result) < 0)
+		return -1;
+
+	begin_op();
+
+	
+	if((dp = namei(path)) == 0 || dp->type != T_DIR){
+		end_op();
+		return -1;
+	}
+	ilock(dp);
+
+	struct dirent de;
+	int i = 0;
+	for(int off = 0; off < dp->size; off += sizeof(de)){
+		if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de)) {
+			panic("lsdel");
+		}
+		if(de.del == 0) 
+			continue;
+
+		// copy string, add \0 if absent
+		for(int j = 0; j < 13; j++) {
+			result[i+j] = de.name[j];
+			if (de.name[j] == '\0') break;
+			if (j == 12) result[i + 13] = '\0';
+		}
+		i += 13;
+	}
+
+	iunlockput(dp);
+	end_op();
+	return i/13;
+}
+
+int
+sys_rec(void)
+{
+	char *path;
+	if(argstr(0, &path) < 0) {
+		return -1;
+	}
+
+	begin_op();
+
+	struct inode *dp;
+	char name[DIRSIZ];
+	if((dp = nameiparent(path, name)) == 0 || dp->type != T_DIR){
+		end_op();
+		return -1;
+	}
+
+	ilock(dp);
+
+	struct inode *ip;
+	uint off = 0;
+	if((ip = dirlookup(dp, name, &off, 1)) == 0)
+	{
+		iunlockput(dp);
+		end_op();
+		return -2;
+	}
+	ilock(ip);
+
+
+	if(ip->type != T_DEL) {
+		iunlockput(dp);
+		iunlockput(ip);
+		end_op();
+		return -3;
+	}
+
+	// mark inode not deleted
+	ip->type = T_FILE;
+	ip->nlink++;
+	// reallocate blocks
+	if(irealloc(ip) != 0) {
+		iunlockput(dp);
+		iunlock(ip);
+		idecref(ip);
+		end_op();
+		return -4;
+	}
+	
+
+	iupdate(ip);
+	iunlockput(ip);
+
+	// mark dirent not deleted
+	char del = 0x00;
+	if(writei(dp, &del, off + 2, sizeof(char)) != sizeof(char))
+		panic("unlink: writei");
+
+	iunlockput(dp);
+	end_op();
 	return 0;
 }

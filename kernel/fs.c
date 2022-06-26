@@ -77,6 +77,24 @@ balloc(uint dev)
 	panic("balloc: out of blocks");
 }
 
+
+// Reallocate a specific freed block.
+static uint
+brealloc(uint dev, uint bi)
+{
+	struct buf *bp = bread(dev, BBLOCK(bi, sb));
+
+	int m = 1 << (bi%8);
+	if((bp->data[bi/8] & m) > 0) {
+		brelse(bp);
+		return -1;
+	}
+	bp->data[bi/8] |= m;
+	log_write(bp);
+	brelse(bp);
+	return 0;
+}
+
 // Free a disk block.
 static void
 bfree(int dev, uint b)
@@ -247,7 +265,7 @@ iget(uint dev, uint inum)
 	// Is the inode already cached?
 	empty = 0;
 	for(ip = &icache.inode[0]; ip < &icache.inode[NINODE]; ip++){
-		if(ip->ref > 0 && ip->dev == dev && ip->inum == inum){
+		if((ip->ref > 0 || ip->type == T_DEL) && ip->dev == dev && ip->inum == inum){
 			ip->ref++;
 			release(&icache.lock);
 			return ip;
@@ -305,8 +323,9 @@ ilock(struct inode *ip)
 		memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
 		brelse(bp);
 		ip->valid = 1;
-		if(ip->type == 0)
-			panic("ilock: no type");
+		// need to support type 0 (deleted)
+		//if(ip->type == 0)
+			//panic("ilock: no type");
 	}
 }
 
@@ -338,13 +357,19 @@ iput(struct inode *ip)
 		if(r == 1){
 			// inode has no links and no other references: truncate and free.
 			itrunc(ip);
-			ip->type = 0;
+			// mark inode as deleted
+			ip->type = T_DEL;
 			iupdate(ip);
 			ip->valid = 0;
 		}
 	}
 	releasesleep(&ip->lock);
 
+	idecref(ip);
+}
+
+void
+idecref(struct inode *ip) {
 	acquire(&icache.lock);
 	ip->ref--;
 	release(&icache.lock);
@@ -397,6 +422,32 @@ bmap(struct inode *ip, uint bn)
 	panic("bmap: out of range");
 }
 
+uint
+irealloc(struct inode *ip)
+{
+	int bnum = 0, n = 0;
+	char bad = 0;
+	for(n; n <= ip->size / BSIZE; n++) {
+		bnum = bmap(ip, n);
+		if(brealloc(ip->dev, bnum) != 0) {
+			bad = 1;
+			break;
+		}
+	}
+
+	// if any block was reused
+	// free all reallocated blocks
+	if(bad == 1) {
+		for(int i = 0; i < n; i++) {
+			bnum = bmap(ip, i);
+			bfree(ip->dev, bnum);
+		}
+		return -1;
+	}
+
+	return 0;
+}
+
 // Truncate inode (discard contents).
 // Only called when the inode has no links
 // to it (no directory entries referring to it)
@@ -412,7 +463,7 @@ itrunc(struct inode *ip)
 	for(i = 0; i < NDIRECT; i++){
 		if(ip->addrs[i]){
 			bfree(ip->dev, ip->addrs[i]);
-			ip->addrs[i] = 0;
+			//ip->addrs[i] = 0;
 		}
 	}
 
@@ -425,11 +476,13 @@ itrunc(struct inode *ip)
 		}
 		brelse(bp);
 		bfree(ip->dev, ip->addrs[NDIRECT]);
-		ip->addrs[NDIRECT] = 0;
+		//ip->addrs[NDIRECT] = 0;
 	}
 
-	ip->size = 0;
-	iupdate(ip);
+	//ip->size = 0;
+
+	// no changes were made to ip
+	//iupdate(ip);
 }
 
 // Copy stat information from inode.
@@ -517,7 +570,7 @@ namecmp(const char *s, const char *t)
 // Look for a directory entry in a directory.
 // If found, set *poff to byte offset of entry.
 struct inode*
-dirlookup(struct inode *dp, char *name, uint *poff)
+dirlookup(struct inode *dp, char *name, uint *poff, char del)
 {
 	uint off, inum;
 	struct dirent de;
@@ -530,7 +583,7 @@ dirlookup(struct inode *dp, char *name, uint *poff)
 			panic("dirlookup read");
 		if(de.inum == 0)
 			continue;
-		if(namecmp(name, de.name) == 0){
+		if(namecmp(name, de.name) == 0 && de.del == del){
 			// entry matches path element
 			if(poff)
 				*poff = off;
@@ -551,7 +604,7 @@ dirlink(struct inode *dp, char *name, uint inum)
 	struct inode *ip;
 
 	// Check that name is not present.
-	if((ip = dirlookup(dp, name, 0)) != 0){
+	if((ip = dirlookup(dp, name, 0, 0)) != 0){
 		iput(ip);
 		return -1;
 	}
@@ -560,12 +613,13 @@ dirlink(struct inode *dp, char *name, uint inum)
 	for(off = 0; off < dp->size; off += sizeof(de)){
 		if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
 			panic("dirlink read");
-		if(de.inum == 0)
+		if(de.inum == 0 || de.del == 1) // deleted dirent is valid for use
 			break;
 	}
 
 	strncpy(de.name, name, DIRSIZ);
 	de.inum = inum;
+	de.del = 0; // mark dirent
 	if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
 		panic("dirlink");
 
@@ -636,7 +690,7 @@ namex(char *path, int nameiparent, char *name)
 			iunlock(ip);
 			return ip;
 		}
-		if((next = dirlookup(ip, name, 0)) == 0){
+		if((next = dirlookup(ip, name, 0, 0)) == 0){
 			iunlockput(ip);
 			return 0;
 		}
